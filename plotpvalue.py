@@ -4,6 +4,8 @@ import pandas as pd
 from scipy.stats import ttest_ind, f_oneway
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from itertools import combinations
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
 
 def get_pvalues(df, x_col, y_col, hue_col, hue_order=None):
     """
@@ -47,6 +49,8 @@ def get_pvalues(df, x_col, y_col, hue_col, hue_order=None):
 
 def get_pvalues_anova(df, x_col, y_col, hue_col):
     """
+    Update: 2025-08-23
+    Use the perform_anova_tukey(df, x_col, y_col, group_col, tukey_on_sig_only=False) function to calculate the detailed anova
     Calculates p-values using ANOVA and Tukey's HSD post-hoc test.
 
     Args:
@@ -160,3 +164,173 @@ def add_pvalue_annotations(df, x_col, y_col, hue_col, ax, hue_order=None, method
         if top_annotation_y > current_top:
             new_top = top_annotation_y + bar_height_offset
             ax.set_ylim(bottom=current_bottom, top=new_top)
+
+def generate_compact_letters(tukey_df, means):
+    """
+    Generates a compact letter display from Tukey HSD results.
+
+    Groups that share a letter are not statistically significantly different.
+
+    Args:
+        tukey_df (pd.DataFrame): The DataFrame from the Tukey HSD results.
+        means (pd.Series): A Series of group means, used for sorting.
+
+    Returns:
+        dict: A dictionary mapping group names to their compact letter string (e.g., 'A', 'B', 'AB').
+    """
+    # Sort groups by mean in descending order
+    sorted_groups = means.sort_values(ascending=False).index.tolist()
+
+    # Create a set of non-significant pairs for quick lookups
+    non_sig_pairs = set()
+    for _, row in tukey_df.iterrows():
+        if not row['reject']:
+            # Add pairs in a consistent order (sorted alphabetically)
+            pair = tuple(sorted((row['group1'], row['group2'])))
+            non_sig_pairs.add(pair)
+
+    # Dictionary to hold the letters for each group
+    group_letters = {group: '' for group in sorted_groups}
+    
+    if not sorted_groups:
+        return group_letters
+
+    # Algorithm to assign letters
+    letter_code = ord('A')
+    
+    # Process groups from highest mean to lowest
+    for i, founder in enumerate(sorted_groups):
+        # If the group already has letters from a higher-mean group, skip
+        if group_letters[founder]:
+            continue
+            
+        current_letter = chr(letter_code)
+        letter_code += 1
+        
+        # This group and all non-significant groups below it get the new letter
+        letter_group = [founder]
+        group_letters[founder] += current_letter
+        
+        # Check subsequent groups
+        for j in range(i + 1, len(sorted_groups)):
+            candidate = sorted_groups[j]
+            
+            # Check if the candidate is non-significant with ALL members of the current letter group
+            is_compatible = all(
+                tuple(sorted((candidate, member))) in non_sig_pairs
+                for member in letter_group
+            )
+            
+            if is_compatible:
+                letter_group.append(candidate)
+                group_letters[candidate] += current_letter
+                
+    return group_letters
+
+
+def perform_anova_tukey(df, x_col, y_col, group_col, tukey_on_sig_only=False):
+    """
+    Performs ANOVA and optionally a Tukey HSD post-hoc test for each week and
+    returns all results in a single consolidated DataFrame.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+        x_col (str): The column name for the weeks or time points or basically the x categorical variable.
+        y_col (str): The column name for the dependent variable.
+        group_col (str): The column name for the group identifiers.
+        tukey_on_sig_only (bool): If True, only runs the Tukey HSD test if the ANOVA p-value is < 0.05.
+
+    Returns:
+        pd.DataFrame: A single DataFrame containing all analysis results, with separators for each week.
+    """
+    all_results_dfs = []
+    weeks = df[x_col].unique() #weeks because initially the x variable was time point in weeks. You can have any x values
+
+    for week in weeks:
+        # Add a separator for the week's analysis
+        separator_text = f"==================== Analysis for {week} ===================="
+        all_results_dfs.append(pd.DataFrame([separator_text], columns=['Analysis Section']))
+        
+        week_df = df[df[x_col] == week].copy()
+        model_formula = f'Q("{y_col}") ~ C({group_col})'
+        
+        try:
+            if week_df[group_col].nunique() < 2:
+                print(f"\nSkipping {week}: Not enough groups to perform ANOVA.")
+                continue
+
+            model = ols(model_formula, data=week_df).fit()
+            
+            # --- ANOVA Results ---
+            anova_table = sm.stats.anova_lm(model, typ=2).reset_index()
+            all_results_dfs.append(pd.DataFrame(["--- ANOVA Results ---"], columns=['Analysis Section']))
+            all_results_dfs.append(anova_table)
+
+            p_value = anova_table['PR(>F)'].iloc[0]
+
+            # --- Tukey HSD and Summary (conditional) ---
+            if not tukey_on_sig_only or p_value < 0.05:
+                tukey_hsd = pairwise_tukeyhsd(endog=week_df[y_col], groups=week_df[group_col], alpha=0.05)
+                tukey_df = pd.DataFrame(data=tukey_hsd._results_table.data[1:], columns=tukey_hsd._results_table.data[0])
+                
+                group_stats = week_df.groupby(group_col)[y_col].agg(['mean', 'std'])
+                letters = generate_compact_letters(tukey_df, group_stats['mean'])
+                group_stats['significance'] = group_stats.index.map(letters)
+
+                tukey_df['group1_sig'] = tukey_df['group1'].map(letters)
+                tukey_df['group2_sig'] = tukey_df['group2'].map(letters)
+                
+                cols_order = ['group1', 'group1_sig', 'group2', 'group2_sig', 'meandiff', 'p-adj', 'lower', 'upper', 'reject']
+                tukey_df = tukey_df[cols_order]
+
+                # Add Tukey results to the list
+                all_results_dfs.append(pd.DataFrame(["--- Tukey HSD Pairwise Comparison ---"], columns=['Analysis Section']))
+                all_results_dfs.append(tukey_df)
+                
+                # Add Group Summary results to the list
+                summary_df = group_stats.sort_values('mean', ascending=False).reset_index()
+                all_results_dfs.append(pd.DataFrame(["--- Group Significance Summary ---"], columns=['Analysis Section']))
+                all_results_dfs.append(summary_df)
+            else:
+                skip_text = f"ANOVA p-value ({p_value:.4f}) is not significant (< 0.05). Skipping Tukey HSD test."
+                all_results_dfs.append(pd.DataFrame([skip_text], columns=['Analysis Section']))
+
+        except Exception as e:
+            error_text = f"Could not perform analysis for {week}. Error: {e}"
+            all_results_dfs.append(pd.DataFrame([error_text], columns=['Analysis Section']))
+        
+        # Add a blank row for spacing
+        all_results_dfs.append(pd.DataFrame([''], columns=['Analysis Section']))
+
+    # Concatenate all DataFrames into a single one
+    consolidated_df = pd.concat(all_results_dfs, ignore_index=True)
+    return consolidated_df
+
+
+def analyze_multiple_y_cols(df, x_col, y_col_list, group_col, tukey_on_sig_only=False):
+    """
+    Wrapper function to run the analysis for a list of y-columns and consolidate results.
+    """
+    all_results_list = []
+
+    for y_col in y_col_list:
+        # Add a main header for the current y-column analysis
+        y_col_header = f"******************** Analysis for Y-Column: {y_col} ********************"
+        all_results_list.append(pd.DataFrame([y_col_header], columns=['Analysis Section']))
+        
+        # Get the detailed weekly analysis for this y-column
+        weekly_results_df = perform_anova_tukey(
+            df=df,
+            x_col=x_col,
+            y_col=y_col,
+            group_col=group_col,
+            tukey_on_sig_only=tukey_on_sig_only
+        )
+        all_results_list.append(weekly_results_df)
+        
+        # Add a blank row for spacing between y-columns
+        all_results_list.append(pd.DataFrame([''], columns=['Analysis Section']))
+
+    # Concatenate everything into the final DataFrame
+    final_df = pd.concat(all_results_list, ignore_index=True)
+    return final_df
