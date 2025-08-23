@@ -167,65 +167,54 @@ def add_pvalue_annotations(df, x_col, y_col, hue_col, ax, hue_order=None, method
 
 def generate_compact_letters(tukey_df, means):
     """
-    Generates a compact letter display from Tukey HSD results.
-
-    Groups that share a letter are not statistically significantly different.
+    Generates a compact letter display from Tukey HSD results to show multiple letters
+    if a group is not significantly different from multiple other groups.
 
     Args:
         tukey_df (pd.DataFrame): The DataFrame from the Tukey HSD results.
         means (pd.Series): A Series of group means, used for sorting.
 
     Returns:
-        dict: A dictionary mapping group names to their compact letter string (e.g., 'A', 'B', 'AB').
+        dict: A dictionary mapping group names to their compact letter string (e.g., 'a', 'b', 'ab').
     """
     # Sort groups by mean in descending order
     sorted_groups = means.sort_values(ascending=False).index.tolist()
 
-    # Create a set of non-significant pairs for quick lookups
-    non_sig_pairs = set()
+    # Create a set of significant pairs for quick lookups
+    sig_pairs = set()
     for _, row in tukey_df.iterrows():
-        if not row['reject']:
-            # Add pairs in a consistent order (sorted alphabetically)
+        if row['reject']:
             pair = tuple(sorted((row['group1'], row['group2'])))
-            non_sig_pairs.add(pair)
+            sig_pairs.add(pair)
 
-    # Dictionary to hold the letters for each group
-    group_letters = {group: '' for group in sorted_groups}
-    
+    # Step 1: Identify the founders of each letter group.
+    # A new letter group is founded by the first group that is significantly
+    # different from all existing founders.
     if not sorted_groups:
-        return group_letters
+        return {}
+        
+    letter_founders = [sorted_groups[0]]
+    for group in sorted_groups[1:]:
+        is_sig_from_all_founders = all(
+            tuple(sorted((group, founder))) in sig_pairs for founder in letter_founders
+        )
+        if is_sig_from_all_founders:
+            letter_founders.append(group)
 
-    # Algorithm to assign letters
-    letter_code = ord('A')
+    # Step 2: Assign letters to all groups based on the founders.
+    # Each group gets the letter of any founder it is NOT significantly different from.
+    group_letters = {group: [] for group in sorted_groups}
+    letter_map = {founder: chr(ord('A') + i) for i, founder in enumerate(letter_founders)}
+
+    for group in sorted_groups:
+        for founder in letter_founders:
+            if group == founder or tuple(sorted((group, founder))) not in sig_pairs:
+                group_letters[group].append(letter_map[founder])
     
-    # Process groups from highest mean to lowest
-    for i, founder in enumerate(sorted_groups):
-        # If the group already has letters from a higher-mean group, skip
-        if group_letters[founder]:
-            continue
-            
-        current_letter = chr(letter_code)
-        letter_code += 1
-        
-        # This group and all non-significant groups below it get the new letter
-        letter_group = [founder]
-        group_letters[founder] += current_letter
-        
-        # Check subsequent groups
-        for j in range(i + 1, len(sorted_groups)):
-            candidate = sorted_groups[j]
-            
-            # Check if the candidate is non-significant with ALL members of the current letter group
-            is_compatible = all(
-                tuple(sorted((candidate, member))) in non_sig_pairs
-                for member in letter_group
-            )
-            
-            if is_compatible:
-                letter_group.append(candidate)
-                group_letters[candidate] += current_letter
-                
-    return group_letters
+    # Join the lists of letters into sorted strings for the final output
+    final_letters = {group: "".join(sorted(letters)) for group, letters in group_letters.items()}
+    
+    return final_letters
 
 
 def perform_anova_tukey(df, x_col, y_col, group_col, tukey_on_sig_only=False):
